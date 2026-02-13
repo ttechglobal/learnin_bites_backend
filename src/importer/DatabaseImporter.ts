@@ -8,20 +8,12 @@ import {
   PastQuestion 
 } from '../models';
 
-/**
- * DatabaseImporter: Saves parsed data to MongoDB
- * 
- * Key concept: TRANSACTIONS
- * - All data from one file is saved together
- * - If ANY part fails, EVERYTHING rolls back
- * - This keeps data consistent (no partial imports)
- */
-
 export interface ImportResult {
   success: boolean;
   fileName: string;
   type: string;
   recordsImported: number;
+  recordsUpdated: number;
   errors: string[];
   warnings: string[];
 }
@@ -30,15 +22,7 @@ export class DatabaseImporter {
   
   /**
    * Import a subject spreadsheet
-   * 
-   * Process:
-   * 1. Start a transaction
-   * 2. Delete existing subject with same code (if exists)
-   * 3. Insert new subject data
-   * 4. Insert all related data (topics, concepts, lessons, questions)
-   * 5. Commit transaction (save everything)
-   * 
-   * If anything fails → rollback (nothing is saved)
+   * Strategy: Upsert (update if exists, create if not)
    */
   async importSubject(data: any, fileName: string): Promise<ImportResult> {
     const session = await mongoose.startSession();
@@ -47,37 +31,87 @@ export class DatabaseImporter {
     try {
       const { subjectInfo, topics, concepts, lessonContent, conceptQuestions } = data;
 
-      // STEP 1: Delete existing subject if it exists
-      // Why? So we can update content by replacing the file
-      await Subject.deleteOne({ code: subjectInfo.subject_code }, { session });
-      
-      // Also delete all related data (cascade delete)
-      const existingSubject = await Subject.findOne({ code: subjectInfo.subject_code });
+      let recordsImported = 0;
+      let recordsUpdated = 0;
+
+      console.log(`\n📦 Processing subject: ${subjectInfo.subject_code}`);
+
+      // ========================================
+      // STEP 1: UPSERT SUBJECT
+      // ========================================
+      const existingSubject = await Subject.findOne({ code: subjectInfo.subject_code }).session(session);
+
+      let subject;
       if (existingSubject) {
-        await Topic.deleteMany({ subjectId: existingSubject._id }, { session });
-        // Topics deletion will cascade to concepts, lessons, and questions
+        console.log(`   ♻️  Updating existing subject`);
+        
+        // Update the subject
+        await Subject.updateOne(
+          { code: subjectInfo.subject_code },
+          {
+            $set: {
+              name: subjectInfo.subject_name,
+              category: subjectInfo.category,
+              level: subjectInfo.level,
+              description: subjectInfo.description,
+              version: subjectInfo.version,
+              boardsSupported: subjectInfo.boards_supported,
+              updatedAt: new Date(),
+            }
+          },
+          { session }
+        );
+        
+        subject = existingSubject;
+        recordsUpdated++;
+
+        // Delete all child data (we'll recreate it fresh)
+        console.log(`   🧹 Cleaning old data...`);
+        
+        const existingTopics = await Topic.find({ subjectId: subject._id }).session(session);
+        const topicIds = existingTopics.map(t => t._id);
+
+        if (topicIds.length > 0) {
+          const existingConcepts = await Concept.find({ topicId: { $in: topicIds } }).session(session);
+          const conceptIds = existingConcepts.map(c => c._id);
+
+          if (conceptIds.length > 0) {
+            await LessonSection.deleteMany({ conceptId: { $in: conceptIds } }, { session });
+            await ConceptQuestion.deleteMany({ conceptId: { $in: conceptIds } }, { session });
+          }
+
+          await Concept.deleteMany({ topicId: { $in: topicIds } }, { session });
+        }
+
+        await Topic.deleteMany({ subjectId: subject._id }, { session });
+        console.log(`   ✅ Old data cleaned`);
+
+      } else {
+        console.log(`   ✨ Creating new subject`);
+        
+        const newSubject = await Subject.create([{
+          code: subjectInfo.subject_code,
+          name: subjectInfo.subject_name,
+          category: subjectInfo.category,
+          level: subjectInfo.level,
+          description: subjectInfo.description,
+          version: subjectInfo.version,
+          boardsSupported: subjectInfo.boards_supported,
+        }], { session });
+        
+        subject = newSubject[0];
+        recordsImported++;
       }
 
-      // STEP 2: Create new subject
-      const subject = await Subject.create([{
-        code: subjectInfo.subject_code,
-        name: subjectInfo.subject_name,
-        category: subjectInfo.category,
-        level: subjectInfo.level,
-        description: subjectInfo.description,
-        version: subjectInfo.version,
-        boardsSupported: subjectInfo.boards_supported,
-      }], { session });
-
-      let recordsImported = 1; // Count the subject
-
-      // STEP 3: Create topics and build a code-to-ID map
-      // Why? We need MongoDB IDs to link concepts to topics
+      // ========================================
+      // STEP 2: CREATE TOPICS
+      // ========================================
+      console.log(`   📚 Creating ${topics.length} topics...`);
       const topicMap = new Map<string, mongoose.Types.ObjectId>();
 
       for (const topicData of topics) {
         const topic = await Topic.create([{
-          subjectId: subject[0]._id,
+          subjectId: subject._id,
           code: topicData.topic_code,
           name: topicData.name,
           description: topicData.description,
@@ -87,8 +121,12 @@ export class DatabaseImporter {
         topicMap.set(topicData.topic_code, topic[0]._id);
         recordsImported++;
       }
+      console.log(`   ✅ Topics created`);
 
-      // STEP 4: Create concepts and build a code-to-ID map
+      // ========================================
+      // STEP 3: CREATE CONCEPTS
+      // ========================================
+      console.log(`   💡 Creating ${concepts.length} concepts...`);
       const conceptMap = new Map<string, mongoose.Types.ObjectId>();
 
       for (const conceptData of concepts) {
@@ -110,8 +148,12 @@ export class DatabaseImporter {
         conceptMap.set(conceptData.concept_code, concept[0]._id);
         recordsImported++;
       }
+      console.log(`   ✅ Concepts created`);
 
-      // STEP 5: Create lesson sections
+      // ========================================
+      // STEP 4: CREATE LESSON SECTIONS
+      // ========================================
+      console.log(`   📖 Creating ${lessonContent.length} lesson sections...`);
       for (const lessonData of lessonContent) {
         const conceptId = conceptMap.get(lessonData.concept_code);
         
@@ -128,8 +170,12 @@ export class DatabaseImporter {
 
         recordsImported++;
       }
+      console.log(`   ✅ Lesson sections created`);
 
-      // STEP 6: Create concept questions
+      // ========================================
+      // STEP 5: CREATE CONCEPT QUESTIONS
+      // ========================================
+      console.log(`   ❓ Creating ${conceptQuestions.length} questions...`);
       for (const questionData of conceptQuestions) {
         const conceptId = conceptMap.get(questionData.concept_code);
         
@@ -153,41 +199,45 @@ export class DatabaseImporter {
 
         recordsImported++;
       }
+      console.log(`   ✅ Questions created`);
 
-      // COMMIT: Save everything to database
+      // ========================================
+      // COMMIT TRANSACTION
+      // ========================================
       await session.commitTransaction();
+      console.log(`   💾 Changes committed to database`);
 
       return {
         success: true,
         fileName,
         type: 'subject',
         recordsImported,
+        recordsUpdated,
         errors: [],
         warnings: [],
       };
 
     } catch (error: any) {
-      // ROLLBACK: If anything failed, undo everything
       await session.abortTransaction();
+      console.log(`   ❌ Import failed, rolling back...`);
       
       return {
         success: false,
         fileName,
         type: 'subject',
         recordsImported: 0,
+        recordsUpdated: 0,
         errors: [error.message],
         warnings: [],
       };
     } finally {
-      // Always end the session
       session.endSession();
     }
   }
 
   /**
    * Import past questions spreadsheet
-   * 
-   * Simpler than subjects - just exam info and questions
+   * Strategy: Delete existing questions for this board+subject, then insert fresh
    */
   async importPastQuestions(data: any, fileName: string): Promise<ImportResult> {
     const session = await mongoose.startSession();
@@ -196,15 +246,20 @@ export class DatabaseImporter {
     try {
       const { examInfo, questions } = data;
 
-      // Delete existing questions for this exam board + subject
-      await PastQuestion.deleteMany({
+      console.log(`\n📝 Processing past questions: ${examInfo.exam_board} - ${examInfo.subject_code}`);
+
+      // Delete existing questions for this exam board + subject combination
+      const deleteResult = await PastQuestion.deleteMany({
         examBoard: examInfo.exam_board,
         subjectCode: examInfo.subject_code,
       }, { session });
 
+      console.log(`   🧹 Deleted ${deleteResult.deletedCount} existing questions`);
+
       let recordsImported = 0;
 
-      // Insert all questions
+      // Insert all questions fresh
+      console.log(`   ❓ Creating ${questions.length} questions...`);
       for (const questionData of questions) {
         await PastQuestion.create([{
           examBoard: examInfo.exam_board,
@@ -227,24 +282,28 @@ export class DatabaseImporter {
       }
 
       await session.commitTransaction();
+      console.log(`   💾 Changes committed to database`);
 
       return {
         success: true,
         fileName,
         type: 'past_questions',
         recordsImported,
+        recordsUpdated: 0,
         errors: [],
         warnings: [],
       };
 
     } catch (error: any) {
       await session.abortTransaction();
+      console.log(`   ❌ Import failed, rolling back...`);
       
       return {
         success: false,
         fileName,
         type: 'past_questions',
         recordsImported: 0,
+        recordsUpdated: 0,
         errors: [error.message],
         warnings: [],
       };

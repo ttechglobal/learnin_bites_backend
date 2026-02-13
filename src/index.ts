@@ -1,9 +1,9 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { connectDatabase } from './src/config/database';
-import { ImportOrchestrator } from './src/importer';
-import apiRoutes from './src/routes';
+import { connectDatabase } from './config/database';
+import { ImportOrchestrator } from './importer';
+import apiRoutes from './routes';
 
 dotenv.config();
 

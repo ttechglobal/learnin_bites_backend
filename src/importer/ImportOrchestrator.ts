@@ -55,7 +55,7 @@ export class ImportOrchestrator {
 
       if (result.success) {
         successCount++;
-        console.log(`✅ Success: ${result.recordsImported} records imported`);
+        console.log(`✅ Success: ${result.recordsImported} created, ${result.recordsUpdated} updated`);
       } else {
         failureCount++;
         console.log(`❌ Failed: ${result.errors.join(', ')}`);
@@ -110,6 +110,7 @@ export class ImportOrchestrator {
           fileName: file.fileName,
           type: parseResult.type || 'unknown',
           recordsImported: 0,
+          recordsUpdated: 0,  // ← ADD THIS
           errors: parseResult.errors,
           warnings: parseResult.warnings,
         };
@@ -128,6 +129,7 @@ export class ImportOrchestrator {
           fileName: file.fileName,
           type: parseResult.type || 'unknown',
           recordsImported: 0,
+          recordsUpdated: 0,  // ← ADD THIS
           errors: ['Unsupported file type'],
           warnings: [],
         };
@@ -144,6 +146,7 @@ export class ImportOrchestrator {
         fileName: file.fileName,
         type: 'unknown',
         recordsImported: 0,
+        recordsUpdated: 0,  // ← ADD THIS
         errors: [error.message],
         warnings: [],
       };
@@ -179,5 +182,3 @@ export class ImportOrchestrator {
     };
   }
 }
-
-
